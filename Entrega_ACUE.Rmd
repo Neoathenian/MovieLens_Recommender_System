@@ -1,0 +1,842 @@
+---
+title: "Recomendadores"
+output: html_document
+---
+
+# Recomendación de películas
+
+## Introducción
+
+A lo largo de esta práctica entrenaremos varios sistemas de recomendación para una base de datos de ratings de películas. Para ello dividiremos en conjuntos de train/test y se hará una selección de hiperparámetros con el conjunto de train, generalmente haciendo un cross-validation de 5-folds (en algunos casos usamos otra división por cuestiones de tiempo de cómputo).
+
+Para la realización de esta práctica, hemos descargado el archivo de 1M de ratings del servicio MovieLens de la página: <http://files.grouplens.org/datasets/movielens/ml-10m-README.html>
+
+Así, lo primero que haremos será leer las bases de datos, creando una rating matrix para luego aplicarle modelos.
+
+```{r message=FALSE, warning=FALSE}
+#Las lecturas son complicadas debido a que el separador usado
+#no es de un solo byte, es decir: :: en vez de :
+#ratings.dat
+library(dplyr)
+library(recommenderlab)
+
+ratings_raw <- readLines("ml-1m/ratings.dat")
+ratings_split <- strsplit(ratings_raw, "::")
+ratings_df <- data.frame(matrix(unlist(ratings_split), nrow=length(ratings_split), byrow=TRUE))
+names(ratings_df) <- c("UserID", "MovieID", "Rating", "Timestamp")
+ratings_df$Rating=as.numeric(ratings_df$Rating)
+
+#movies.dat
+movies_raw <- readLines("ml-1m/movies.dat")
+movies_split <- strsplit(movies_raw, "::")
+movies_df <- data.frame(matrix(unlist(movies_split), nrow=length(movies_split), byrow=TRUE))
+names(movies_df) <- c("MovieID", "Title", "Genres")
+
+#Hacemos un join de movies_df y ratings_df sobre la columna MovieID
+#para que se sepan los nombres de las películas 
+merged_df <- merge(ratings_df,movies_df, by = "MovieID", all.x = F)
+
+#rating_matrix
+rat_mat=as(merged_df[,c("UserID","Title","Rating")],"realRatingMatrix")
+```
+
+Haremos una breve inspección de los datos. Así, podemos ver que los ratings medio por usuario parecen seguir una distribución normal.
+
+```{r}
+library(ggplot2) 
+hist(getRatings(normalize(rat_mat)), breaks=100)
+```
+
+Podemos ver además, que tanto las películas como los usuarios reciben pocos ratings, siendo la película que mas ratings ha recibido "American Beauty (1999)" con 3428 ratings.
+
+```{r}
+print(paste0("Peli con mas ratings: ",names(which.max(colCounts(rat_mat)))[1]," con: ", sum(!is.na(as(rat_mat[,128],"matrix")))," ratings"))
+```
+
+Mostramos a continuación los histo
+
+```{r}
+par(mfrow=c(1,2)) # Set up a 1x2 layout for the plots
+hist(rowCounts(rat_mat), breaks=50, main="Counts ratings users") 
+hist(colCounts(rat_mat), breaks=20, main="Counts ratings Películas") 
+
+```
+
+## Modelo lineal
+
+Para el modelo lineal usaremos como variables los géneros a los que pertenece la película.
+
+```{r}
+library(stringr)
+
+unique_genres <- unique(unlist(str_split(movies_df$Genres, "\\|")))
+
+# One-hot encode la columna de géneros
+
+genre_matrix <- t(sapply(movies_df$Genres, function(x) {
+  split_vec <- str_split(x, "\\|")[[1]]
+  as.integer(unique_genres %in% split_vec)
+}))
+
+# Hacemos que se vea claro cual es cada columna
+colnames(genre_matrix) <- unique_genres
+OH_encoded_movies=cbind(movies_df[,c("MovieID","Title")], genre_matrix)
+merged_df <- merge(ratings_df[,c("UserID","MovieID","Rating")], OH_encoded_movies, by = "MovieID", all.x = TRUE)
+```
+
+A continuación separaremos en train/test de manera que no se haya ningún usuario en común entre estos dos grupos. Así, haremos que el 80% de los usuarios se usen para train y el resto para test.
+
+```{r}
+# Get unique user IDs
+user_ids <- unique(ratings_df$UserID)
+
+# Randomly shuffle user IDs
+set.seed(123)
+user_ids <- sample(user_ids)
+
+# Calculate number of users in train and test sets
+n_train_users <- ceiling(length(user_ids) * 0.8)
+n_test_users <- length(user_ids) - n_train_users
+
+# Split user IDs into train and test sets
+train_user_ids <- user_ids[1:n_train_users]
+test_user_ids <- user_ids[(n_train_users + 1):length(user_ids)]
+
+# Obtenemos el train/test
+train <- merged_df %>% filter(UserID %in% train_user_ids)
+test <- merged_df %>% filter(UserID %in% test_user_ids)
+```
+
+Con el conjunto de train entrenaremos un modelo lineal simple y miraremos sus coeficientes:
+
+```{r}
+predictors <- colnames(train)[!colnames(train) %in% c("MovieID", "UserID","Title")]
+lin_mod=lm(Rating ~ .,train[, predictors])# best_glm$lambda)
+
+#Esto lo guardamos para luego comparar este modelo con los demás
+lin_mod_pred=predict(lin_mod,newdata=test[,predictors[-1]])
+test[,"Prediction"]=lin_mod_pred
+rat_mat_lm=as(test[,c("UserID","Title","Prediction")],"realRatingMatrix")
+
+#Tenemos que hacer que tenga las mismas columnas que la rating matrix para luego poder hacer evaluaciones
+rat_mat_lm=as(rat_mat_lm,"matrix")
+
+#Creamos una máscara de 0s
+rat_mat_lm2 <- matrix(0, nrow = nrow(rat_mat_lm), ncol = ncol(rat_mat))
+colnames(rat_mat_lm2)=colnames(rat_mat)
+# Rellenamos la máscara
+match_cols <- match(colnames(rat_mat_lm), colnames(rat_mat))
+rat_mat_lm2[, colnames(rat_mat_lm2)] <- rat_mat_lm2[, colnames(rat_mat_lm2)]
+rownames(rat_mat_lm2)=rownames(rat_mat_lm)
+
+rat_mat_lm=as(rat_mat_lm2,"realRatingMatrix")
+```
+
+De momento no mostraremos las métricas de este modelo como son el RSME, pues las mostraremos al final de este trabajo junto a los demás modelos, para lo cual tendremos que transformar este modelo en un recomendador de pleno derecho (capaz de hacer recomendaciones). Por ahora, veamos cuales son los valores de los parámetros de nuestro modelo lineal. Cuanto mayor sea en valor absoluto un coeficiente, mayor influencia tendrá, si es positivo indica que aumentará el rating, y si es negativo es lo disminuirá.
+
+```{r}
+lin_mod$coefficients
+```
+
+Como podemos ver, las películas empiezan con un rating de 3.5, y en base a los géneros a los que pertenece se mueve mas o menos en alguna de las direcciones. Destacan Animation, Documentary y Film-Noir por ser las mejor valoradas, mientras que peor valoradas son Children´s y Horror. Los resultados no son sorprendentes porque si los que ponen ratings son adultos (o teenagers), las películas orientadas a niños no les van a gustar. Además, las películas de miedo no suelen gustar por dejarte con pesadillas o porque no dan miedo (es imposible ganar con estas películas al público general :) ). Cabe destacar que si alguien ve un documental es porque está altamente interesado en el tema, lo que sube sus ratings. Film-noir es algo "de las décadas de 1930 a 1950", y la verdad es que buscando pelis de esto me deja igual. Finalmente todo el mundo sabe que el anime es lo mejor :P.
+
+A continuación dejo un histograma para mostrar la distribución de ratings predichos que muestra que están casi todoe en torno a 3.3-4.
+
+```{r}
+hist(lin_mod_pred)
+```
+
+## Recomendadores basados en rating_matrix
+
+Antes de entrar en los detalles de estos modelos, es importante destacar que para estos modelos usaremos solo consideraremos usuarios con al menos 10 ratings (variable "given"), y consideraremos que un rating es bueno (la película le ha gustado) si es un rating de 4 o superior. Esto último vendrá codificado como goodRating, y nos servirá para tener métricas de recall y precisión (nos permite obtener un problema de clasificación).
+
+```{r}
+rat_mat_train=rat_mat[train_user_ids,]
+rat_mat_test=rat_mat[test_user_ids,]
+```
+
+### Popular recommender
+
+El primer recomendador del que hablaremos es el basado en popularidad. Este es el mas sencillo pues no es personalizado, solo recomienda a cada usuario el elemento mas popular al que todavía no le ha dado un rating. Para ver la popularidad de cada elemento, basta calcular la media de sus ratings. Por lo simple que es, no haremos un grid-search, pues ok único que el paquete permite variar es como se calcula la popularidad (media ratings).
+
+```{r results="hide"}
+#k is para el tema de NN
+scheme <- evaluationScheme(rat_mat_train, method="cross", k=5, given=10, goodRating=4)
+algorithms <- list(
+  "Popular" = list(name="Popular")
+)
+results <- evaluate(scheme, algorithms, n=c(1, 3, 5, 10, 15, 20))
+
+plot(results, annotate=c(1,3), legend="topleft")
+plot(results, "prec/rec", annotate=3)
+
+```
+
+El popular recommender es nuestro baseline, que vemos que tiene valores en torno 0.1 de recall y 0.4 de precisión.
+
+### Item-based recommender
+
+El siguiente recomendador a tratar es el basado en los objetos. Así, se compara el rating que ha hecho un usuario con el producto (película) a comparar. Así, se calcula su similitud y se el recomienda el que mas se parezca.
+
+En este clasificador miraremos como parámetro que función usaremos de similitud. Las posibilidades que consideraremos son la similitud del coseno, de Jaccard y la de Pearson.
+
+```{r message=FALSE, warning=FALSE, results="hide"}
+#k is para el tema de NN
+scheme <- evaluationScheme(rat_mat_train, method="cross", k=5, given=10, goodRating=4)
+algorithms <- list(
+  "IBCF_Jaccard" = list(name="IBCF", param=list(normalize="Z-score",method="Jaccard")),
+  "IBCF_Cosine" = list(name="IBCF", param=list(normalize="Z-score",method="Cosine")),
+  "IBCF_Pearson" = list(name="IBCF", param=list(normalize="Z-score",method="Pearson"))
+)
+results <- evaluate(scheme, algorithms, n=c(1, 3, 5, 10, 15, 20))
+
+plot(results, annotate=c(1,3), legend="topleft")
+plot(results, "prec/rec", annotate=3)
+
+```
+
+Como podemos ver, la que mejor resultado ha dado es la de Pearson, aunque todos los resultados son pésimos. Viendo estos terribles resultados decidimos hacer un grid search para probar valores tanto pequeños como grandes, probando así un total de 48 distintas combinaciones, usando también hiperparámetros como son k (indica el número de películas con las que comparar) y normalize_sim_matrix (indica si se normaliza la matriz de ratings).
+
+Los resultados obtenidos siguen siendo pésimos, obteniendo tan solo 0.046 de recall y 0.053 de precisión como mucho (código no mostrado).
+
+```{r eval=FALSE, include=FALSE}
+library(foreach)
+library(doParallel)
+library(parallel)
+library(iterators)
+#setup parallel backend to use many processors
+cores=detectCores()
+cl <- makeCluster(cores[1]-1) #not to overload your computer
+registerDoParallel(cl)
+
+library(recommenderlab)
+
+param_grid=expand.grid(k = c(5,10,15,30,100,200,500,1000), sim_options = c("cosine", "pearson","Jaccard"),normalize_sim_matrix=c(F,T))
+scheme <- evaluationScheme(rat_mat_train, method="cross", k=2, given=10, goodRating=4)
+
+
+results_ibcf=list()
+#Esto está comentado para que no se ejecute (lo ejecute una vez, y al cabo de unas horas perdí los resultados tras haberlos obtenido el día siguiente (se me olvidó guardarlos))
+#results_ibcf=foreach(i=1:nrow(param_grid), .combine = 'c',.export = c('evaluate')) %dopar% {
+#  
+#  algo=list("algo1"=list(name="IBCF", param=list(k=param_grid$k[i],method=param_grid$sim_options[i])))
+#  print(algo)
+#  aux=evaluate(scheme,algo , n=c(1, 3, 5, 10, 15, 20))
+#   
+#  aux$algo1
+#}
+
+#stop cluster
+stopCluster(cl)
+
+#recommenderRegistry$get_entry("IBCF")
+```
+
+```{r eval=FALSE, include=FALSE}
+results_ibcf=as(unlist(results_ibcf),"evaluationResultList")
+algo_names=c()
+for(i in 1:nrow(param_grid))
+  {
+    algo_names=c(algo_names,i)
+}
+names(results_ibcf)=algo_names
+#plot(results_ibcf)#No merece la pena ver este plot (mucho ruido)
+```
+
+```{r eval=FALSE, include=FALSE}
+avgs_ibcf=avg(results_ibcf)
+recalls_ibcf=c()
+precisions_ibcf=c()
+for(i in 1:length(avgs_ibcf))
+{
+  recalls_ibcf=c(recalls_ibcf,max(avgs_ubcf[[i]][,"recall"]))
+  precisions_ibcf=c(precisions_ibcf,max(avgs_ibcf[[i]][,"precision"]))  
+}
+print(paste0("max recall: ",round(max(recalls_ibcf,na.rm=T),3)))
+print(paste0("max precision: ",round(max(precisions_ibcf,na.rm=T),3)))
+```
+
+### User-based recommender
+
+El siguiente recomendador que veremos es el basado en en usuarios. Así, para asignarle a un usuario un rating, se le asignará un rating comparando el usuario a otros usuarios con una función de similitud, que ponderará la opinión de este usuario sobre el producto a estudiar. Esto se expresa como:
+
+$$
+Rating(U,p)= \overline{R_U}+\frac{\sum_{k\in K} sim(U,k)(R_{k,p}-\overline{R_{k}})}{\sum_{k\in K}sim(U,k)},
+$$
+
+donde calculamos el rating del producto "p" para el usuario U, usando a los usuarios en "K", sus ratings, "$R_{k,p}$", y la media de sus ratings $\overline{R_k}$.
+
+De nuevo, tenemos como posible hiperparámetro la función de similitud a usar. Además, otros parámetro que estudiaremos son "nn", que es el número de usuarios que consideraremos (tomando los de mayor similitud) "min_matching_items" es el mínimo número de películas que debe tener el usuario que recomienda con el usuario buscando película para ser considerado. "min_predictive_items" es el mínimo número de películas que alguien debe tener para poder recomendar. Este hiperparámetro no lo usaremos pues nos estaba dando errores en ejecución.
+
+De nuevo, primero elegiremos el método, y posteriormente trataremos de optimizar alguno de estos otros hiperparámetros.
+
+```{r message=FALSE, warning=FALSE, results="hide"}
+#k is para el tema de NN
+scheme <- evaluationScheme(rat_mat_train, method="cross", k=2, given=10, goodRating=4)
+algorithms <- list(
+  "uBCF_Jaccard" = list(name="UBCF", param=list(normalize="Z-score",method="Jaccard")),
+  "uBCF_Cosine" = list(name="UBCF", param=list(normalize="Z-score",method="Cosine")),
+  "uBCF_Pearson" = list(name="UBCF", param=list(normalize="Z-score",method="Pearson"))
+)
+results <- evaluate(scheme, algorithms, n=c(1, 3, 5, 10, 15, 20))
+
+plot(results, annotate=c(1,3), legend="topleft")
+plot(results, "prec/rec", annotate=3)
+
+```
+
+Los resultados son de nuevo pésimos, pero podemos ver que el mejor es Cosine, así que continuaremos con ese.
+
+Como podemos ver, el min_predictive_items no parece tener efecto en nuestro caso.
+
+```{r message=FALSE, warning=FALSE, results="hide"}
+#k is para el tema de NN
+scheme <- evaluationScheme(rat_mat_train, method="cross", k=2, given=10, goodRating=4)
+algorithms <- list(
+  "UBCF_min_matching_items_0" = list(name="UBCF", param=list(normalize="Z-score",method="Cosine", min_matching_items=0)),
+  "UBCF_min_matching_items_1" = list(name="UBCF", param=list(normalize="Z-score",method="Cosine", min_matching_items=1)),
+  "UBCF_min_matching_items_2" = list(name="UBCF", param=list(normalize="Z-score",method="Cosine", min_matching_items=2)),
+  "UBCF_min_matching_items_3" = list(name="UBCF", param=list(normalize="Z-score",method="Cosine", min_matching_items=3)),
+  "UBCF_min_matching_items_5" = list(name="UBCF", param=list(normalize="Z-score",method="Cosine", min_matching_items=5)),
+  "UBCF_min_matching_items_10" =list(name="UBCF", param=list(normalize="Z-score",method="Cosine",min_matching_items=10))
+)
+results <- evaluate(scheme, algorithms, n=c(1, 3, 5, 10, 15, 20))
+
+plot(results, annotate=c(1,3), legend="topleft")
+plot(results, "prec/rec", annotate=3)
+
+```
+
+Vemos claramente que el mejor valor para min_matching_items es claramente 10, lo cual no es sorprendente, pues obliga a las personas a ser tan parecidas como sea posible.
+
+Este parámetro tampoco parece tener efecto. Estudiaremos por tanto nuestro último parámetro "nn":
+
+```{r message=FALSE, warning=FALSE, results="hide"}
+#k is para el tema de NN
+scheme <- evaluationScheme(rat_mat_train, method="cross", k=2, given=10, goodRating=4)
+algorithms <- list(
+  "UBCF_nn_1" = list(name="UBCF", param=list(normalize="Z-score",min_matching_items=10,method="Cosine", nn=1)),
+  "UBCF_nn_5" = list(name="UBCF", param=list(normalize="Z-score",min_matching_items=10,method="Cosine", nn=5)),
+  "UBCF_nn_10" =list(name="UBCF", param=list(normalize="Z-score",min_matching_items=10,method="Cosine", nn=10)),
+  "UBCF_nn_20" =list(name="UBCF", param=list(normalize="Z-score",min_matching_items=10,method="Cosine", nn=20)),
+  "UBCF_nn_50" =list(name="UBCF", param=list(normalize="Z-score",min_matching_items=10,method="Cosine", nn=50)),
+  "UBCF_nn_100"=list(name="UBCF", param=list(normalize="Z-score",min_matching_items=10,method="Cosine",nn=100)),
+  "UBCF_nn_500"=list(name="UBCF", param=list(normalize="Z-score",min_matching_items=10,method="Cosine",nn=500))
+)
+results <- evaluate(scheme, algorithms, n=c(1, 3, 5, 10, 15, 20))
+
+plot(results, annotate=c(1,3), legend="topleft")
+plot(results, "prec/rec", annotate=3)
+
+```
+
+Vemos que el mejor valor para "nn" es 1. Por lo pequeño que es, haremos una última ronda de evaluaciones de nn para los valores: 1,2,3,4 y 5:
+
+```{r message=FALSE, warning=FALSE, results="hide"}
+#k is para el tema de NN
+scheme <- evaluationScheme(rat_mat_train, method="cross", k=2, given=10, goodRating=4)
+algorithms <- list(
+  "UBCF_nn_1" = list(name="UBCF", param=list(normalize="Z-score",min_matching_items=10,method="Cosine", nn=1)),
+  "UBCF_nn_2" = list(name="UBCF", param=list(normalize="Z-score",min_matching_items=10,method="Cosine", nn=2)),
+  "UBCF_nn_3" =list(name="UBCF", param=list(normalize="Z-score",min_matching_items=10,method="Cosine", nn=3)),
+  "UBCF_nn_4" =list(name="UBCF", param=list(normalize="Z-score",min_matching_items=10,method="Cosine", nn=4)),
+  "UBCF_nn_5" =list(name="UBCF", param=list(normalize="Z-score",min_matching_items=10,method="Cosine", nn=5))
+)
+results <- evaluate(scheme, algorithms, n=c(1, 3, 5, 10, 15, 20))
+
+plot(results, annotate=c(1,3), legend="topleft")
+plot(results, "prec/rec", annotate=3)
+
+```
+
+Al final, vemos que el mejor valor para el parámetro de los vecinos es 1. Por tanto, los hiperparámetros que usaremos para UBCF son min_matching_items=10,method="Cosine", nn=1.
+
+Después de todo este análisis con los hiperparámetros empezamos a cuestionarnos si es hay siquiera alguna zona donde funcione este algoritmo correctamente (al nivel de "popular"). Por eso, a continuación mostramos un grid search en muchísimos hiperparámetros intentando cubrir tanto valores pequeños como grandes. Sin embargo el resultado (código no mostrado) como se puede ver es decepcionante alcanzando tan solo máximos de 0.047 para el recall y de 0.232 para la precisión (este último no está tan mal).
+
+```{r eval=FALSE, include=FALSE}
+library(foreach)
+library(doParallel)
+library(parallel)
+library(iterators)
+#setup parallel backend to use many processors
+cores=detectCores()
+cl <- makeCluster(cores[1]-1) #not to overload your computer
+registerDoParallel(cl)
+
+param_grid=expand.grid(nn = c(1,5,10,15,30,100,200,500,1000), sim_options = c("cosine", "pearson","Jaccard"),weighted=c(F,T),min_matching_items=c(1,5,10,15,20,30,100),min_predictive_items=c(1,5,10,15,20,30,100))
+
+scheme <- evaluationScheme(rat_mat_train, method="cross", k=2, given=10, goodRating=4)
+
+#Esto está comentado para que no se ejecute (lo ejecute una vez, y al cabo de unas horas perdí los resultados tras haberlos obtenido el día siguiente (se me olvidó guardarlos))
+#results_ubcf=foreach(i=1:nrow(param_grid), .combine = 'c',.export = c('evaluate')) %dopar% {
+#  
+#  algo=list("algo1"=list(name="UBCF", #param=list(nn=param_grid$nn[i],method=param_grid$sim_options[i],weighted=param_grid$weighted[i],min_matching_items=param#_grid$min_matching_items[i],min_predictive_items=param_grid$min_predictive_items[i])))
+#  print(algo)
+#  aux=evaluate(scheme,algo , n=c(1, 3, 5, 10, 15, 20))
+#   
+#  aux$algo1
+#}
+
+#stop cluster
+stopCluster(cl)
+#recommenderRegistry$get_entry("UBCF")
+```
+
+```{r eval=FALSE, include=FALSE}
+results_ubcf=as(unlist(results_ubcf),"evaluationResultList")
+algo_names=c()
+for(i in 1:nrow(param_grid))
+  {
+    algo_names=c(algo_names,i)
+}
+names(results_ubcf)=algo_names
+#plot(results_ubcf)#No merece la pena ver este plot (mucho ruido)
+```
+
+```{r eval=FALSE, include=FALSE}
+#saveRDS(results_ubcf, file = "results_ubcf.rds")
+```
+
+```{r eval=FALSE, include=FALSE}
+avgs_ubcf=avg(results_ubcf)
+recalls_ubcf=c()
+precisions_ubcf=c()
+for(i in 1:length(avgs_ubcf))
+{
+  recalls_ubcf=c(recalls_ubcf,max(avgs_ubcf[[i]][,"recall"]))
+  precisions_ubcf=c(precisions_ubcf,max(avgs_ubcf[[i]][,"precision"]))  
+}
+print(paste0("max recall: ",round(max(recalls_ubcf,na.rm=T),3)))
+print(paste0("max precision: ",round(max(precisions_ubcf,na.rm=T),3)))
+```
+
+### Matrix Factorization recommender
+
+El último recomendador que veremos es el basado en la factorización matricial, donde lo que haremos es factorizar nuestra matriz de ratings en: $$
+Rating\_matrix=X\theta^T
+$$ donde tratamos de extraer $k$ características, de manera que $X$ es $nºusuarios \times k$ y $\theta$ es $nºpelis \times k$. Como el objetivo es predecir la rating_matrix, para recommendar una película, basta elegir la fila correspondiente al usuario y mirar que película no ha visto y tiene mayor valor.
+
+```{r echo=FALSE}
+#Obtenido de https://github.com/sanealytics/recommenderlabrats
+library(recommenderlab)
+
+.get_parameters <- function(p, parameter) {
+  if(!is.null(parameter) && length(parameter) != 0) {
+    o <- pmatch(names(parameter), names(p))
+    
+    if(any(is.na(o)))
+      stop(sprintf(ngettext(length(is.na(o)),
+                            "Unknown option: %s",
+                            "Unknown options: %s"),
+                   paste(names(parameter)[is.na(o)],
+                         collapse = " ")))
+    
+    p[o] <- parameter
+  }
+  
+  p
+}
+
+
+
+REAL_RSVD <- function(data, parameter= NULL) {
+  
+  p <- .get_parameters(list(
+    categories = min(100, round(dim(data@data)[2]/2)),
+    normalize = "center",
+    lambda = 1.5, # regularization
+    optim_more = FALSE,
+    minRating = NA,
+    itmNormalize = FALSE,
+    sampSize = NULL,
+    scaleFlg = FALSE,
+    item_bias_fn=function(x) {0},
+    maxit = 100, # Number of iterations for optim
+    optimize = function(...) {optim(method = "L-BFGS-B", ...)}
+  ), parameter)
+  
+  
+  
+  model <- c(list(
+    description = "full matrix",
+    data = data
+  ), p)
+  
+  predict <- function(model, newdata, n = 10,
+                      type=c("topNList", "ratings"), ...) {
+    
+    type <- match.arg(type)
+    n <- as.integer(n)
+    
+    # Combine new user
+    combineddata <- model$data@data
+    combineddata <- rbind(combineddata, newdata@data)
+    
+    Y <- t(as.matrix(combineddata)) # This changes NAs to 0
+    if(!is.null(model$sampSize)) {
+      Y <- Y[, sample(ncol(Y), model$sampSize)]
+      print("Took sample of size ", model$sampSize)
+    }
+    
+    R <- 1 * (Y != 0)
+    
+    Y.avg  <- apply(Y, 1, function(x) {tmp = x
+    tmp[tmp==0] <- NA
+    mn = mean(tmp, na.rm = TRUE)
+    if(is.na(mn)) 0 else mn
+    })
+    
+    # Adjusted
+    if(p$itmNormalize) {
+      print("Mean normalize by items")
+      Y      <- (Y - Y.avg) * R
+    } else {
+      print("Did not Mean normalize")
+    }
+    
+    # initialization
+    num_movies <- dim(Y)[1]
+    num_users  <- dim(Y)[2]
+    num_features <- model$categories
+    lambda = model$lambda
+    maxit = model$maxit
+    # We are going to scale the data so that optim converges quickly
+    scale.fctr <- base::max(base::abs(Y))
+    if (model$scaleFlg) {
+      print("scaling down")
+      Y <- Y / scale.fctr
+    }
+    
+    print(system.time(
+      res <- model$optimize(par = runif(num_movies * num_features + num_users * num_features), 
+                            fn = J_cost, gr = grr, 
+                            Y=Y, R=R, 
+                            num_users=num_users, num_movies=num_movies,num_features=num_features, 
+                            lambda=lambda, control=list(maxit=maxit, trace=1)) 
+    ))    
+    
+    print(paste("final cost: ", res$value, " convergence: ", res$convergence, 
+                res$message, " counts: ", res$counts["function"]))
+    
+    unrolled <- unroll_Vecs(res$par, Y, R, num_users, num_movies, num_features)
+    
+    X_final     <- unrolled$X
+    theta_final <- unrolled$Theta
+    
+    Y_final <- (X_final %*% t(theta_final) )
+    if (model$scaleFlg) {
+      Y_final <- Y_final * scale.fctr 
+    }
+    
+    FUN <- match.fun(model$item_bias_fn)
+    Y.adj   <- FUN(Y.avg)
+    print(paste0("applying item_bias_fn  range ", min(Y.adj), " to ", max(Y.adj)))
+    Y_final <- Y_final + Y.adj
+    
+    dimnames(Y_final) = dimnames(Y)
+    
+    ratings <- t(Y_final)
+    
+    # Only need to give back new users
+    ratings <- ratings[(dim(model$data@data)[1]+1):dim(ratings)[1],]
+    
+    ratings <- new("realRatingMatrix", data=drop0(ratings))
+    
+    ratings@normalize <- newdata@normalize
+    
+    ratings <- removeKnownRatings(ratings, newdata)
+    
+    if(type=="ratings") return(ratings)
+    
+    getTopNLists(ratings, n=n, minRating=model$minRating)
+    
+  }
+  
+  # Helper functions
+  
+  unroll_Vecs <- function (params, Y, R, num_users, num_movies, num_features) {
+    endIdx <- num_movies * num_features
+    
+    X     <- matrix(params[1:endIdx], nrow = num_movies, ncol = num_features)
+    Theta <- matrix(params[(endIdx + 1): (endIdx + (num_users * num_features))], 
+                    nrow = num_users, ncol = num_features)
+    
+    Y_dash     <-   (((X %*% t(Theta)) - Y) * R)
+    
+    return(list(X = X, Theta = Theta, Y_dash = Y_dash))
+  }
+  
+  J_cost <-  function(params, Y, R, num_users, num_movies, num_features, lambda) {
+    
+    unrolled <- unroll_Vecs(params, Y, R, num_users, num_movies, num_features)
+    X <- unrolled$X
+    Theta <- unrolled$Theta
+    Y_dash <- unrolled$Y_dash
+    
+    J <-  .5 * sum(   Y_dash ^2)  + lambda/2 * sum(Theta^2) + lambda/2 * sum(X^2)
+    
+    return (J) #list(J, grad))
+  }
+  
+  grr <- function(params, Y, R, num_users, num_movies, num_features, lambda) {
+    
+    unrolled <- unroll_Vecs(params, Y, R, num_users, num_movies, num_features)
+    X <- unrolled$X
+    Theta <- unrolled$Theta
+    Y_dash <- unrolled$Y_dash
+    
+    X_grad     <- (   Y_dash  %*% Theta) + lambda * X
+    Theta_grad <- ( t(Y_dash) %*% X)     + lambda * Theta
+    
+    grad = c(X_grad, Theta_grad)
+    return(grad)
+  }
+  
+  ## construct recommender object
+  new("Recommender", method = "RSVD", dataType = class(data),
+      ntrain = nrow(data), model = model, predict = predict)
+}
+
+# Helper functions
+# if( !is.null(recommenderRegistry["RSVD", "realRatingMatrix"])) {
+#   recommenderRegistry$delete_entry(
+#     method="RSVD", dataType = "realRatingMatrix", fun=REAL_RSVD,
+#     description="Recommender based on Low Rank Matrix Factorization (real data).")
+# }
+
+# register recommender
+recommenderRegistry$set_entry(
+  method="RSVD", dataType = "realRatingMatrix", fun=REAL_RSVD,
+  description="Recommender based on Low Rank Matrix Factorization (real data).")
+```
+
+Usando la versión de este algoritmo de <https://github.com/sanealytics/recommenderlabrats>, entrenaremos nuestro recomendador mediante el descenso del gradiente. Así, destacaremos los siguientes parámetros:
+
+-   "categories": que hace referencia al número de características $k$ del que hablamos antes .
+
+-   "lambda": es un valor similar al lambda del glm pues afecta de forma análoga a la función de error con la que se entrena, por lo que cuanto mayor sea, mas sencillo será el modelo.
+
+-   "itm_Normalize": indica si se normaliza los ratings de cada película.
+
+```{r message=FALSE, warning=FALSE, results="hide"}
+#k is para el tema de NN
+scheme <- evaluationScheme(rat_mat_train, method="cross", k=2, given=10, goodRating=4)
+algorithms <- list(
+  "RVSD" = list(name="RSVD", param=list(itmNormalize=T)),
+  "RVSD_item_norm" = list(name="RSVD", param=list(itmNormalize=T))
+)
+results <- evaluate(scheme, algorithms, n=c(1, 3, 5, 10, 15, 20))
+
+plot(results, annotate=c(1,3), legend="topleft")
+plot(results, "prec/rec", annotate=3)
+
+```
+
+Como vemos, itmNormalize no afecta a los resultados, por lo que nos quedaremos con los defaults (False). Veamos ahora los valores para lambda.
+
+```{r message=FALSE, warning=FALSE, results="hide"}
+#k is para el tema de NN
+scheme <- evaluationScheme(rat_mat_train, method="cross", k=5, given=10, goodRating=4)
+algorithms <- list(
+  "RVSD_lambda_1" = list(name="RSVD", param=list(lambda=1)),
+  "RVSD_lambda_2" = list(name="RSVD", param=list(lambda=2)),
+  "RVSD_lambda_3" = list(name="RSVD", param=list(lambda=3)),
+  "RVSD_lambda_5" = list(name="RSVD", param=list(lambda=5)),
+  "RVSD_lambda_10"= list(name="RSVD", param=list(lambda=10)),
+  "RVSD_lambda_15"= list(name="RSVD", param=list(lambda=15)),
+  "RVSD_lambda_20"= list(name="RSVD", param=list(lambda=20)),
+  "RVSD_lambda_50"= list(name="RSVD", param=list(lambda=50)),
+  "RVSD_lambda_100"= list(name="RSVD",param=list(lambda=100)),
+  "RVSD_lambda_200"= list(name="RSVD", param=list(lambda=200))
+)
+results <- evaluate(scheme, algorithms, n=c(1, 3, 5, 10, 15, 20))
+
+plot(results, annotate=c(1,3), legend="topleft")
+plot(results, "prec/rec", annotate=3)
+
+```
+
+El gráfico anterior está muy poblado, pero aún así se puede ver que los mejores son lambda=10,20 y 200. Debido a que 200 es elevadísimo y obtiene resultados similares a 20, nos quedaremos con lambda=20.
+
+```{r message=FALSE, warning=FALSE, results="hide"}
+#k is para el tema de NN
+scheme <- evaluationScheme(rat_mat_train, method="cross", k=5, given=10, goodRating=4)
+algorithms <- list(
+  "RVSD_k_1"= list(name="RSVD", param=list(lambda=20,categories=1)),
+  "RVSD_k_2"= list(name="RSVD", param=list(lambda=20,categories=2)),
+  "RVSD_k_5"= list(name="RSVD", param=list(lambda=20,categories=5)),
+  "RVSD_k_10"= list(name="RSVD", param=list(lambda=20,categories=10)),
+  "RVSD_k_15"= list(name="RSVD", param=list(lambda=20,categories=15)),
+  "RVSD_k_20"= list(name="RSVD", param=list(lambda=20,categories=20)),
+  "RVSD_k_30"= list(name="RSVD", param=list(lambda=20,categories=30)),
+  "RVSD_k_50"= list(name="RSVD", param=list(lambda=20,categories=50))
+)
+
+results <- evaluate(scheme, algorithms, n=c(1, 3, 5, 10, 15, 20))
+
+plot(results, annotate=c(1,3), legend="topleft")
+plot(results, "prec/rec", annotate=3)
+
+```
+
+Mirando los resultados, podemos ver que el número de categorías tiene una gran relevancia, siendo los mejores los superiores a 10. Por este motivo nos quedaremos con este parámetro, siendo los parámetros finales: lambda=20,categories=10.
+
+### Posibles motivos de fallo de los algoritmos
+
+Tanto el ibcf como el ubcf han fracasado estrepitosamente, y uno podría pensar que esto es culpa de la programación del algoritmo. Además, en <https://www.r-bloggers.com/2015/03/matrix-factorization/> muestran que les estupendamente. Sin embargo, cuando nosotros probamos el mismo código a continuación (añadiendo ibcf) no obtenemos los mismos resultados:
+
+```{r message=FALSE, warning=FALSE, results="hide"}
+#La única modificación a este código es la eliminación de las importaciones RSVD y algunos saltos de línea
+require(recommenderlab) # Install this if you don't have it already
+
+data(MovieLense) # Get data
+# Divvy it up
+scheme <- evaluationScheme(MovieLense, method = "split", train = .9,
+                           k = 1, given = 10, goodRating = 4) 
+
+# Some algorithms to test against
+algorithms <- list(
+  "random items" = list(name="RANDOM", param=list(normalize = "Z-score")),
+  "popular items" = list(name="POPULAR", param=list(normalize = "Z-score")),
+  "user-based CF" = list(name="UBCF", param=list(normalize = "Z-score",
+                                                 method="Cosine",
+                                                 nn=50, minRating=3)),
+  "item-based CF" = list(name="IBCF", param=list(normalize = "Z-score",
+                                                 method="Cosine")),
+   "Matrix Factorization" = list(name="RSVD", param=list(categories = 10, 
+                                                        lambda = 10,
+                                                        maxit = 100))
+)
+
+results <- evaluate(scheme, algorithms, n=c(1, 3, 5, 10, 15, 20))
+plot(results, annotate = 1:4, legend="topleft")
+plot(results, "prec/rec", annotate=3)
+```
+
+Por otro lado, mostraremos a continuación un código en el que todos los algoritmos funcionan correctamente (resultados similares)
+
+```{r message=FALSE, warning=FALSE, results="hide"}
+data(Jester5k)
+scheme <- evaluationScheme(Jester5k[1:1000], method="cross", k=4, given=3, goodRating=5)
+algorithms <- list(
+  "random items" = list(name="RANDOM", param=list(normalize = "Z-score")),
+  "popular items" = list(name="POPULAR", param=list(normalize = "Z-score")),
+  "user-based CF" = list(name="UBCF", param=list(normalize = "Z-score",
+                                                 method="Cosine",
+                                                 nn=50, minRating=3)),
+  "item-based CF" = list(name="IBCF", param=list(normalize = "Z-score",
+                                                 method="Cosine")),
+   "Matrix Factorization" = list(name="RSVD", param=list(categories = 10, 
+                                                        lambda = 10,
+                                                        maxit = 100))
+)
+results <- evaluate(scheme, algorithms, n=c(1, 3, 5, 10, 15, 20))
+
+plot(results, annotate=c(1,3), legend="topleft")
+plot(results, "prec/rec", annotate=3)
+```
+
+Toda esta problemática sobre que los algoritmos están funcionando mal proviene de que hemos visto en ese blog que deberían funcionar de cierta manera. Sin embargo, deberíamos compararlo con el método puramente aleatorio. De esta manera, vemos que el UBCS actúa similar al aleatorio, mientras que el ibcf actúa peor. Por tanto, aunque nos deberíamos preocupar por el UBCF, nos deberíamos preocupar incluso mas por el IBCF (que parece que está aprendiendo "lo opuesto a lo que debería" :) ).
+
+```{r message=FALSE, warning=FALSE, results="hide"}
+#La única modificación a este código es la eliminación de las importaciones RSVD y algunos saltos de línea
+require(recommenderlab) # Install this if you don't have it already
+
+data(MovieLense) # Get data
+# Divvy it up
+scheme <- evaluationScheme(MovieLense, method = "split", train = .9,
+                           k = 1, given = 10, goodRating = 4) 
+
+# Some algorithms to test against
+algorithms <- list(
+  "random items" = list(name="RANDOM", param=list(normalize = "Z-score")),
+  "user-based CF" = list(name="UBCF", param=list(normalize = "Z-score",
+                                                 method="Cosine",
+                                                 nn=50, minRating=3)),
+  "item-based CF" = list(name="IBCF", param=list(normalize = "Z-score",
+                                                 method="Cosine"))
+)
+
+results <- evaluate(scheme, algorithms, n=c(1, 3, 5, 10, 15, 20))
+plot(results, annotate = 1:4, legend="topleft")
+plot(results, "prec/rec", annotate=3)
+```
+
+## Comparativa resultados de test
+
+Como ya hemos elegido los resultados
+
+Haciendo un train/test split, ¿que métricas obtenemos? Como recordatorio, la división train/test se hizo al principio de este trabajo, así usaremos los datos de train para entrenar cada uno de los clasificadores, y predeciremos las top10 recomendaciones usando los de test.
+
+Para evaluar nuestros modelos tenemos que tener cuidado, pues si hacemos la típica idea de dividir los datos disponibles en un conjunto de entrenamiento y un conjunto de pruebam donde entrenamos el sistema de recomendación con el conjunto de entrenamiento y lo utilizamos para predecir las calificaciones de los ítems en el conjunto de prueba. Entonces, podemos comparar estas calificaciones predichas con las calificaciones verdaderas en el conjunto de prueba para evaluar el rendimiento del sistema de recomendación. Sin embargo, si solo evaluamos el sistema de recomendación en los ítems que están en el conjunto de prueba, podemos subestimar su rendimiento, ya que puede ser bueno para predecir calificaciones para los ítems que están en el conjunto de prueba, pero malo para predecir calificaciones para ítems que no están en el conjunto de prueba. Esto se conoce como el problema de "inicio en frío" y puede ser un desafío importante para los sistemas de recomendación.
+
+Para solucionar este problema, podemos utilizar una estrategia de evaluación diferente llamada "validación cruzada de dejar uno fuera". En este enfoque, fingimos que cada calificación conocida a su vez es la calificación "desconocida" que queremos predecir y evaluamos la capacidad del sistema de recomendación para predecirla en función de las calificaciones conocidas restantes para ese usuario. Luego podemos promediar el rendimiento sobre todas las calificaciones "desconocidas" (unknown en código) para obtener una estimación del rendimiento general del sistema.
+
+```{r message=FALSE, warning=FALSE, results="hide"}
+library(recommenderlab)
+e_train=evaluationScheme(rat_mat_train,given=10,goodRating=4,train=1)
+#Quiero usar de los datos de test que haga cálculos con el "unknown" (pero no me está dejando usarlos todos)
+#Generalmente el evaluationScheme te hace el train/test con known y unknown, pero tenemos el modelo lineal 
+#y queremos que use los mismos datos (usará 1 menos porque no me deja poner train=0) y el modelo lineal no 
+#sufre de cold-start
+e_test=evaluationScheme(rat_mat_test,given=10,goodRating=4,k=1,method="split",train=0.001)
+
+
+#Tenemos que adaptar la matriz del modelo lineal porque al hacer las evaluaciones vamos a perder un dato
+rat_mat_lm=as(rat_mat_lm,"matrix")
+
+match_rows <- match(as.numeric(rownames(rat_mat_lm)), as.numeric(rownames(as(getData(e_test,"unknown"),"matrix"))))
+rat_mat_lm <- rat_mat_lm[match_rows[!is.na(match_rows)],]
+
+rat_mat_lm=as(rat_mat_lm,"realRatingMatrix")
+
+
+# train the model on rat_mat_train
+Popular_mod<-Recommender(getData(e_train,"train"), method = "Popular")
+IBCF_mod  <- Recommender(getData(e_train,"train"), method = "IBCF", param=list(normalize="Z-score",method="Pearson"))
+UBCF_mod  <- Recommender(getData(e_train,"train"), method = "UBCF", param=list(normalize="Z-score",min_matching_items=10,method="Cosine", nn=1))
+RSVD_mod  <- Recommender(getData(e_train,"train"), method = "RSVD", param=list(lambda=20,categories=10))
+
+# generate recommendations on rat_mat_test
+rat_mat_Popular <- predict(Popular_mod,getData(e_test,"known"), type = "topN",given=10,goodRating=4)
+rat_mat_IBCF <-    predict(IBCF_mod,getData(e_test,"known"),    type = "topN",given=10,goodRating=4)
+rat_mat_UBCF <-    predict(UBCF_mod,getData(e_test,"known"),    type = "topN",given=10,goodRating=4)
+rat_mat_RSVD <-    predict(RSVD_mod,getData(e_test,"known"),    type = "topN",given=10,goodRating=4)
+```
+
+Veamos la tabla de los resultados:
+
+```{r}
+rbind(
+  Linear=calcPredictionAccuracy(getTopNLists(rat_mat_lm),getData(e_test,"unknown"),given=10,goodRating=4),
+  Popular=calcPredictionAccuracy(rat_mat_Popular,getData(e_test,"unknown"),given=10,goodRating=4),
+  IBCF=calcPredictionAccuracy(rat_mat_IBCF,getData(e_test,"unknown"),given=10,goodRating=4),
+  UBCF=calcPredictionAccuracy(rat_mat_UBCF,getData(e_test,"unknown"),given=10,goodRating=4),
+  RSVD=calcPredictionAccuracy(rat_mat_RSVD,getData(e_test,"unknown"),given=10,goodRating=4))
+```
+
+Podemos ver que los que mejor predicen son el popular y el RSVD tal y como esperábamos, pues el IBCF y UBCF obtuvieron un recall y precision muy bajos en comparación en la búsqueda de hiperparámetros, y realmente nos faltaba por ver el lineal, que como vemos es mejor que el IBCF pero peor que el UBCF, así que tampoco es bueno.
+
+Podemos ver por tanto, que el mejor modelo es el RSVD, que tiene tanto mejor recall como precisión.
+
+```{r message=FALSE, warning=FALSE, results="hide"}
+rat_mat_Popular <- predict(Popular_mod,getData(e_test,"known"), type = "ratings",given=10,goodRating=4)
+rat_mat_IBCF <-    predict(IBCF_mod,getData(e_test,"known"),    type = "ratings",given=10,goodRating=4)
+rat_mat_UBCF <-    predict(UBCF_mod,getData(e_test,"known"),    type = "ratings",given=10,goodRating=4)
+rat_mat_RSVD <-    predict(RSVD_mod,getData(e_test,"known"),    type = "ratings",given=10,goodRating=4)
+```
+
+```{r}
+rbind(
+  Linear=calcPredictionAccuracy(rat_mat_lm,getData(e_test,"unknown"),given=10,goodRating=4),
+  Popular=calcPredictionAccuracy(rat_mat_Popular,getData(e_test,"unknown"),given=10,goodRating=4),
+  IBCF=calcPredictionAccuracy(rat_mat_IBCF,getData(e_test,"unknown"),given=10,goodRating=4),
+  UBCF=calcPredictionAccuracy(rat_mat_UBCF,getData(e_test,"unknown"),given=10,goodRating=4),
+  RSVD=calcPredictionAccuracy(rat_mat_RSVD,getData(e_test,"unknown"),given=10,goodRating=4))
+```
+
+Como última medida miramos métricas mas generales como son el RSME, donde aunque ahora gana el popular, vemos que el IBCF y UBCF no lo hacen tan mal, mientras que el lineal falla mucho. Esto nos indica que los ratings que predicen UBCF e IBCF no son del todo malo, pero justo los que está recomendando no son adecuados. De todas formas, como cuando se hacen recomendaciones se hacen un número finito (y pequeño de estas), estas medidas no son tan buenas como el recall y el precision. Por este motivo, RSVD y Popular son los mejores modelos, pero al menos, con estas medidas podemos obtener una intuición de lo que falló con los otros modelos.
+
+## Conclusiones
+
+Tal y como se presentaba en el enunciado, hemos entrenado recomendadores de tipo popular, user-based, item-based, lineal y de factorización matricial. De esta manera, hemos determinado que el mejor algoritmo de estos para nuestro dataset de películas es el de factorización matricial (RSVD), estando como segundo cercano el "Popular".
